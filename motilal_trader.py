@@ -71,11 +71,13 @@ mofsl_sessions_lock = threading.Lock()
 # GitHub storage config
 ###############################################################################
 
-GITHUB_OWNER = os.getenv("GITHUB_OWNER", "").strip()
-GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip() or "main"
-GITHUB_DATA_ROOT = (os.getenv("GITHUB_DATA_ROOT", "data").strip() or "data").strip("/")
+GITHUB_OWNER = _env_first("GITHUB_OWNER", "GITHUB_REPO_OWNER")
+GITHUB_REPO = _env_first("GITHUB_REPO", "GITHUB_REPO_NAME")
+GITHUB_BRANCH = _env_first("GITHUB_BRANCH", default="main") or "main"
+GITHUB_TOKEN = _env_first("GITHUB_TOKEN", "GITHUB_PAT", "GITHUB_ACCESS_TOKEN")
+
+# Root folder in repo that contains "users/...". Typical: "data"
+GITHUB_DATA_ROOT = (_env_first("GITHUB_DATA_ROOT", "GITHUB_ROOT", "DATA_ROOT", default="data").strip().strip("/") or "data")
 
 def _github_enabled() -> bool:
     return bool(GITHUB_OWNER and GITHUB_REPO and GITHUB_TOKEN)
@@ -423,3 +425,4 @@ def delete_group(request: Request, group_name: str = Query("", alias="group_name
 # Trading endpoints (place_order/get_orders/positions/etc.) should use mofsl_sessions
 # keyed by (owner_userid, client_id). If you want, I can wire those next.
 ###############################################################################
+
