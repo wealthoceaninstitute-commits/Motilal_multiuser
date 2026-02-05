@@ -221,6 +221,20 @@ def _safe_int_token(x):
 # Basic endpoints
 ###############################################################################
 
+@app.get("/debug_env")
+def debug_env():
+    """Safe env diagnostics (does NOT expose secrets)."""
+    missing = _github_missing()
+    return {
+        "github_configured": len(missing) == 0,
+        "missing": missing,
+        "github_owner_set": bool(GITHUB_OWNER),
+        "github_repo_set": bool(GITHUB_REPO),
+        "github_branch": GITHUB_BRANCH,
+        "github_data_root": GITHUB_DATA_ROOT,
+        "github_token_len": len(GITHUB_TOKEN) if GITHUB_TOKEN else 0,
+    }
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True, "symbols_db_ready": _db_ready(), "auth_router": bool(auth_router is not None)}
@@ -295,16 +309,38 @@ def search_symbols(q: str = Query("", alias="q"), exchange: str = Query("", alia
 
     return JSONResponse(content={"results": results, "options": options, "count": len(results)})
 
-GITHUB_OWNER = os.getenv("GITHUB_OWNER", "").strip()
-GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip() or "main"
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+def _env_first(*keys: str, default: str = "") -> str:
+    """Return first non-empty env var among keys (stripped)."""
+    for k in keys:
+        v = os.getenv(k, "")
+        if v is None:
+            continue
+        v = str(v).strip()
+        if v:
+            return v
+    return str(default).strip()
 
-# Root folder in repo that contains "users/...". In your screenshot it's "data/users/..."
-GITHUB_DATA_ROOT = os.getenv("GITHUB_DATA_ROOT", "data").strip().strip("/") or "data"
+# --- GitHub storage configuration (accept legacy key names too) ---
+GITHUB_OWNER = _env_first("GITHUB_OWNER", "GITHUB_REPO_OWNER")
+GITHUB_REPO = _env_first("GITHUB_REPO", "GITHUB_REPO_NAME")
+GITHUB_BRANCH = _env_first("GITHUB_BRANCH", default="main") or "main"
+GITHUB_TOKEN = _env_first("GITHUB_TOKEN", "GITHUB_PAT", "GITHUB_ACCESS_TOKEN")
+
+# Root folder in repo that contains "users/...". Typical: "data"
+GITHUB_DATA_ROOT = (_env_first("GITHUB_DATA_ROOT", "GITHUB_ROOT", "DATA_ROOT", default="data").strip().strip("/") or "data")
+
+def _github_missing() -> List[str]:
+    missing = []
+    if not GITHUB_OWNER:
+        missing.append("GITHUB_OWNER")
+    if not GITHUB_REPO:
+        missing.append("GITHUB_REPO")
+    if not GITHUB_TOKEN:
+        missing.append("GITHUB_TOKEN")
+    return missing
 
 def _github_enabled() -> bool:
-    return bool(GITHUB_OWNER and GITHUB_REPO and GITHUB_TOKEN)
+    return len(_github_missing()) == 0
 
 def _gh_headers() -> Dict[str, str]:
     return {
@@ -323,7 +359,7 @@ def _github_get(path: str) -> Dict[str, Any]:
     Returns dict or {"__not_found__": True} if missing.
     """
     if not _github_enabled():
-        raise HTTPException(status_code=503, detail="GitHub storage not configured. Set GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN in Render Environment.")
+        raise HTTPException(status_code=500, detail=f"GitHub storage not configured. Missing: {', '.join(_github_missing())}. Set GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN in Render Environment.")
     url = _gh_api_url(path)
     try:
         r = requests.get(url, headers=_gh_headers(), params={"ref": GITHUB_BRANCH}, timeout=30)
@@ -342,7 +378,7 @@ def _github_put(path: str, content_bytes: bytes, message: str) -> Dict[str, Any]
     Create/update a file in GitHub at 'path' (repo-relative).
     """
     if not _github_enabled():
-        raise HTTPException(status_code=503, detail="GitHub storage not configured. Set GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN in Render Environment.")
+        raise HTTPException(status_code=500, detail=f"GitHub storage not configured. Missing: {', '.join(_github_missing())}. Set GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN in Render Environment.")
 
     # check existing to obtain sha (required for updates)
     existing = _github_get(path)
@@ -407,29 +443,10 @@ def _pick(*vals: Any) -> str:
             return s
     return ""
 
-def _normalize_userid(v: Any) -> str:
-    """Accepts values like: pra, "pra", %22pra%22 (already decoded by FastAPI), etc."""
-    s = ("" if v is None else str(v)).strip()
-    if not s:
-        return ""
-    # strip surrounding quotes
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        s = s[1:-1].strip()
-    return s.strip()
-
-def get_user_from_request(request: Request, header_user: str = "") -> str:
-    """Resolve logged-in user from X-User-Id header OR query params (userid/user_id)."""
-    uid = _normalize_userid(header_user)
-    if uid:
-        return uid
-    qp = request.query_params
-    uid = _normalize_userid(qp.get("user_id") or qp.get("userid") or qp.get("uid") or qp.get("user"))
-    return uid
-
-def require_user(uid: str) -> str:
-    uid = _normalize_userid(uid)
+def require_user(user_id: str) -> str:
+    uid = (user_id or "").strip()
     if not uid:
-        raise HTTPException(status_code=401, detail="Missing user identity. Send X-User-Id header (recommended) or userid/user_id query param.")
+        raise HTTPException(status_code=401, detail="Missing X-User-Id header (logged in user).")
     return uid
 
 def _client_rel_path(user_id: str, client_id: str) -> str:
@@ -441,7 +458,6 @@ def _client_dir(user_id: str) -> str:
 
 @app.post("/add_client")
 async def add_client(
-    request: Request,
     payload: Dict[str, Any] = Body(...),
     user_id: str = Header("", alias="X-User-Id"),
 ) -> Dict[str, Any]:
@@ -449,7 +465,7 @@ async def add_client(
     Save a Motilal client for the logged-in user into GitHub.
     Reference fields from CT_FastAPI: name, userid, password, pan, apikey, totpkey, capital, session_active. fileciteturn4file4L1-L22
     """
-    uid = require_user(get_user_from_request(request, user_id))
+    uid = require_user(user_id)
 
     client_id = _pick(payload.get("userid"), payload.get("client_id"))
     if not client_id:
@@ -472,14 +488,13 @@ async def add_client(
 
 @app.get("/get_clients")
 def get_clients(
-    request: Request,
     user_id: str = Header("", alias="X-User-Id"),
 ) -> Dict[str, Any]:
     """
     Load clients for logged-in user from GitHub.
     UI fields follow CT_FastAPI get_clients response: name, client_id, capital, session. fileciteturn4file4L25-L46
     """
-    uid = require_user(get_user_from_request(request, user_id))
+    uid = require_user(user_id)
 
     out: List[Dict[str, Any]] = []
     dir_path = _client_dir(uid)
@@ -511,95 +526,3 @@ def get_clients(
     return {"clients": out}
 
 
-
-
-###############################################################################
-# Compatibility routes (frontend expects these)
-###############################################################################
-
-@app.get("/clients")
-def clients_alias(
-    request: Request,
-    user_id: str = Header("", alias="X-User-Id"),
-) -> Dict[str, Any]:
-    """Alias for UI compatibility: GET /clients -> same as /get_clients"""
-    return get_clients(request=request, user_id=user_id)
-
-@app.post("/clients")
-async def clients_add_alias(
-    request: Request,
-    payload: Dict[str, Any] = Body(...),
-    user_id: str = Header("", alias="X-User-Id"),
-) -> Dict[str, Any]:
-    """Alias: POST /clients -> same as /add_client"""
-    return await add_client(request=request, payload=payload, user_id=user_id)
-
-###############################################################################
-# Groups (minimal GitHub-backed, per-user)
-###############################################################################
-
-def _groups_rel_path(user_id: str) -> str:
-    return f"{GITHUB_DATA_ROOT}/users/{_safe(user_id)}/groups.json"
-
-def _load_groups(uid: str) -> List[str]:
-    p = _groups_rel_path(uid)
-    doc = _github_read_json(p) or {}
-    groups = doc.get("groups") if isinstance(doc, dict) else None
-    if isinstance(groups, list):
-        out = []
-        for g in groups:
-            s = str(g).strip()
-            if s:
-                out.append(s)
-        return sorted(list(dict.fromkeys(out)))
-    return []
-
-def _save_groups(uid: str, groups: List[str]) -> None:
-    p = _groups_rel_path(uid)
-    doc = {"groups": sorted(list(dict.fromkeys([str(g).strip() for g in groups if str(g).strip()])))}
-    _github_write_json(p, doc, message=f"Update groups for {uid}")
-
-@app.get("/groups")
-def get_groups(
-    request: Request,
-    user_id: str = Header("", alias="X-User-Id"),
-) -> Dict[str, Any]:
-    uid = require_user(get_user_from_request(request, user_id))
-    if not _github_enabled():
-        # Don't crash UI; return empty with a warning
-        return {"groups": [], "warning": "GitHub storage not configured"}
-    return {"groups": _load_groups(uid)}
-
-@app.post("/groups")
-def add_group(
-    request: Request,
-    payload: Dict[str, Any] = Body(...),
-    user_id: str = Header("", alias="X-User-Id"),
-) -> Dict[str, Any]:
-    uid = require_user(get_user_from_request(request, user_id))
-    if not _github_enabled():
-        raise HTTPException(status_code=503, detail="GitHub storage not configured")
-    name = (payload.get("name") or payload.get("group") or "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Group name required")
-    groups = _load_groups(uid)
-    if name not in groups:
-        groups.append(name)
-        _save_groups(uid, groups)
-    return {"success": True, "groups": _load_groups(uid)}
-
-@app.delete("/groups")
-def delete_group(
-    request: Request,
-    payload: Dict[str, Any] = Body(...),
-    user_id: str = Header("", alias="X-User-Id"),
-) -> Dict[str, Any]:
-    uid = require_user(get_user_from_request(request, user_id))
-    if not _github_enabled():
-        raise HTTPException(status_code=503, detail="GitHub storage not configured")
-    name = (payload.get("name") or payload.get("group") or "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Group name required")
-    groups = [g for g in _load_groups(uid) if g != name]
-    _save_groups(uid, groups)
-    return {"success": True, "groups": _load_groups(uid)}
