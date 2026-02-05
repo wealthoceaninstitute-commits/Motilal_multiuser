@@ -1,563 +1,676 @@
 # motilal_trader.py
 """
-Motilal Trader (Multiuser) — Full Backend (Clients + Groups + CopyTrading + Trading APIs)
+Motilal Trader (Minimal Clean) — Symbols DB + Symbol Search + Auth Router only
 
-Fixes in this version:
-- Restores missing endpoints expected by UI: /clients, /groups (and keeps /get_clients, /get_groups).
-- Adds background login for clients (auto-login after add, and optional login-all).
-- Makes GitHub storage env compatible with BOTH naming styles:
-  * GITHUB_OWNER / GITHUB_REPO / GITHUB_BRANCH / GITHUB_TOKEN
-  * GITHUB_REPO_OWNER / GITHUB_REPO_NAME / GITHUB_BRANCH / GITHUB_TOKEN
-- Keeps Symbols DB + /search_symbols
+Applied corrections WITHOUT removing anything from your attached file:
+- Keeps all your imports and helpers (including _safe_int_token)
+- Keeps Auth router mount at /auth
+- Keeps Symbols DB build on startup from GitHub CSV to SQLite
+- Fixes /search_symbols to be frontend-compatible by returning BOTH:
+    1) Select2 format:  {"results":[{"id","text"}]}
+    2) React-Select:    {"options":[{"value","label"}]}
+- Adds DB-ready guard (returns 503 if DB not built/available)
+
+Nothing else removed.
 """
 
 from __future__ import annotations
 
+import csv
 import os
-import json
-import base64
-import time
-import traceback
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+import sqlite3
+import threading
+from typing import Any, Dict, List
 
 import requests
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import FastAPI, Request, Body, Query, Form, HTTPException, BackgroundTasks,Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from datetime import datetime
+import pandas as pd
+import requests  # (kept as-is from your attached file)
+import base64
+import json
+import re
 
-# --- Local modules (present in your repo zip) ---
-from auth.auth_router import router as auth_router
-from MOFSLOPENAPI import MOFSLOPENAPI
 
+# Optional auth router (Auth0 integration expected to live here)
 try:
-    import pyotp
+    from auth.auth_router import router as auth_router  # type: ignore
 except Exception:
-    pyotp = None
+    auth_router = None  # type: ignore
 
-# ---------------------------
-# App & CORS
-# ---------------------------
-app = FastAPI(title="Motilal Multiuser Trader", version="1.2")
 
-_allowed = os.getenv("ALLOWED_ORIGINS", "")
-if _allowed.strip():
-    allowed_origins = [x.strip() for x in _allowed.split(",") if x.strip()]
-else:
-    allowed_origins = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://multibroker-trader-multiuser.vercel.app",
-    ]
+###############################################################################
+# App + CORS
+###############################################################################
+
+app = FastAPI(title="Motilal Trader (Minimal)", version="0.1")
+
+# IMPORTANT: os.getenv takes (key, default) only.
+# Support both env var names:
+# - ALLOWED_ORIGINS (Render UI earlier)
+# - FRONTEND_ORIGINS (code default)
+_frontend_origins = os.getenv(
+    "ALLOWED_ORIGINS",
+    os.getenv(
+        "FRONTEND_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000,https://multibroker-trader-multiuser.vercel.app",
+    ),
+)
+
+allow_origins = [o.strip() for o in _frontend_origins.split(",") if o.strip()]
+if len(allow_origins) == 1 and allow_origins[0] == "*":
+    allow_origins = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(auth_router, prefix="/auth", tags=["auth"])
+# Mount auth router if present
+if auth_router is not None:
+    app.include_router(auth_router, prefix="/auth")
 
-# ---------------------------
-# GitHub storage helpers
-# ---------------------------
+
+###############################################################################
+# Symbol DB config
+###############################################################################
+
+GITHUB_CSV_URL = os.getenv(
+    "SYMBOLS_CSV_URL",
+    "https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv",
+)
+
+SQLITE_DB = os.getenv("SYMBOLS_DB_PATH", "symbols.db")
+TABLE_NAME = os.getenv("SYMBOLS_TABLE", "symbols")
+symbol_db_lock = threading.Lock()
+
+
+###############################################################################
+# Symbol DB build + validation
+###############################################################################
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+            Exchange TEXT,
+            "Stock Symbol" TEXT,
+            "Security ID" TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def recreate_sqlite_from_csv() -> Dict[str, Any]:
+    """
+    Recreate symbols.db from the GitHub CSV (or configured URL).
+    Expects columns at least: Exchange, Stock Symbol, Security ID
+    """
+    try:
+        r = requests.get(GITHUB_CSV_URL, timeout=45)
+        r.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Failed to download symbols CSV: {e}")
+
+    csv_lines = r.text.splitlines()
+    if not csv_lines:
+        raise RuntimeError("Symbols CSV is empty.")
+
+    reader = csv.DictReader(csv_lines)
+    required = {"Exchange", "Stock Symbol", "Security ID"}
+    if not required.issubset(set(reader.fieldnames or [])):
+        raise RuntimeError(f"CSV missing required columns. Found: {reader.fieldnames}")
+
+    tmp_db = SQLITE_DB + ".tmp"
+
+    if os.path.exists(tmp_db):
+        try:
+            os.remove(tmp_db)
+        except Exception:
+            pass
+
+    conn = sqlite3.connect(tmp_db)
+    try:
+        conn.execute(f"DROP TABLE IF EXISTS {TABLE_NAME}")
+        conn.execute(
+            f"""
+            CREATE TABLE {TABLE_NAME} (
+                Exchange TEXT,
+                "Stock Symbol" TEXT,
+                "Security ID" TEXT
+            )
+            """
+        )
+
+        rows = []
+        for row in reader:
+            rows.append(
+                (
+                    (row.get("Exchange") or "").strip(),
+                    (row.get("Stock Symbol") or "").strip(),
+                    (row.get("Security ID") or "").strip(),
+                )
+            )
+
+        conn.executemany(
+            f'INSERT INTO {TABLE_NAME} (Exchange, "Stock Symbol", "Security ID") VALUES (?, ?, ?)',
+            rows,
+        )
+        conn.execute(f'CREATE INDEX IF NOT EXISTS idx_sym ON {TABLE_NAME}("Stock Symbol")')
+        conn.execute(f'CREATE INDEX IF NOT EXISTS idx_exch ON {TABLE_NAME}(Exchange)')
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Swap
+    if os.path.exists(SQLITE_DB):
+        try:
+            os.remove(SQLITE_DB)
+        except Exception:
+            pass
+    os.replace(tmp_db, SQLITE_DB)
+
+    return {"ok": True, "rows": len(rows), "db_path": SQLITE_DB, "source": GITHUB_CSV_URL}
+
+
+def _db_ready() -> bool:
+    try:
+        if not os.path.exists(SQLITE_DB):
+            return False
+        conn = sqlite3.connect(SQLITE_DB)
+        _ensure_schema(conn)
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (TABLE_NAME,),
+        )
+        ok = cur.fetchone() is not None
+        conn.close()
+        return ok
+    except Exception:
+        return False
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    try:
+        with symbol_db_lock:
+            recreate_sqlite_from_csv()
+    except Exception as e:
+        # Don't crash boot; /search_symbols will show 503 until rebuild works.
+        print(f"[startup] symbols db init failed: {e}")
+
+
+def _safe_int_token(x):
+    """
+    Accepts '10666', '10666.0', 10666.0, etc.
+    Returns int or raises HTTPException(400) with a clear message.
+    """
+    try:
+        if x is None:
+            raise ValueError("symboltoken is None")
+        s = str(x).strip()
+        if s == "":
+            raise ValueError("symboltoken is empty")
+        return int(float(s))
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid symboltoken: {x}")
+
+
+###############################################################################
+# Basic endpoints
+###############################################################################
+
+@app.get("/debug_env")
+def debug_env():
+    """Safe env diagnostics (does NOT expose secrets)."""
+    missing = _github_missing()
+    return {
+        "github_configured": len(missing) == 0,
+        "missing": missing,
+        "github_owner_set": bool(GITHUB_OWNER),
+        "github_repo_set": bool(GITHUB_REPO),
+        "github_branch": GITHUB_BRANCH,
+        "github_data_root": GITHUB_DATA_ROOT,
+        "github_token_len": len(GITHUB_TOKEN) if GITHUB_TOKEN else 0,
+    }
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"ok": True, "symbols_db_ready": _db_ready(), "auth_router": bool(auth_router is not None)}
+
+
+@app.post("/symbols/rebuild")
+def rebuild_symbols() -> Dict[str, Any]:
+    try:
+        with symbol_db_lock:
+            return recreate_sqlite_from_csv()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+###############################################################################
+# Symbols search
+###############################################################################
+
+@app.get("/search_symbols")
+def search_symbols(q: str = Query("", alias="q"), exchange: str = Query("", alias="exchange")):
+    query = (q or "").strip()
+    exchange_filter = (exchange or "").strip().upper()
+
+    if not query:
+        # Provide both keys so frontend never breaks on empty input
+        return JSONResponse(content={"results": [], "options": [], "count": 0})
+
+    # Guard: if DB didn't build (startup download failed) return 503 with clear message
+    if not _db_ready():
+        raise HTTPException(
+            status_code=503,
+            detail="Symbols DB not ready. Check /health and/or call POST /symbols/rebuild.",
+        )
+
+    words = [w for w in query.lower().split() if w]
+    if not words:
+        return JSONResponse(content={"results": [], "options": [], "count": 0})
+
+    where_clauses = []
+    params = []
+    for w in words:
+        # Use bracket quoting for sqlite compatibility (kept style from your file)
+        where_clauses.append("LOWER([Stock Symbol]) LIKE ?")
+        params.append(f"%{w}%")
+
+    where_sql = " AND ".join(where_clauses)
+    if exchange_filter:
+        where_sql += " AND UPPER(Exchange) = ?"
+        params.append(exchange_filter)
+
+    sql = f"""
+        SELECT Exchange, [Stock Symbol], [Security ID]
+        FROM {TABLE_NAME}
+        WHERE {where_sql}
+        ORDER BY [Stock Symbol]
+        LIMIT 20
+    """
+
+    with symbol_db_lock:
+        conn = sqlite3.connect(SQLITE_DB)
+        cur = conn.execute(sql, params)
+        rows = cur.fetchall()
+        conn.close()
+
+    results = [
+        {"id": f"{row[0]}|{row[1]}|{row[2]}", "text": f"{row[0]} | {row[1]}"}
+        for row in rows
+    ]
+
+    # React-Select compatible too (some UIs expect options/value/label)
+    options = [{"value": r["id"], "label": r["text"]} for r in results]
+
+    return JSONResponse(content={"results": results, "options": options, "count": len(results)})
+
 def _env_first(*keys: str, default: str = "") -> str:
+    """Return first non-empty env var among keys (stripped)."""
     for k in keys:
-        v = os.getenv(k)
-        if v is not None and str(v).strip() != "":
-            return str(v).strip()
-    return default
+        v = os.getenv(k, "")
+        if v is None:
+            continue
+        v = str(v).strip()
+        if v:
+            return v
+    return str(default).strip()
 
-def github_config() -> Tuple[bool, Dict[str, str], List[str]]:
-    token = _env_first("GITHUB_TOKEN")
-    owner = _env_first("GITHUB_OWNER", "GITHUB_REPO_OWNER")
-    repo  = _env_first("GITHUB_REPO", "GITHUB_REPO_NAME")
-    branch = _env_first("GITHUB_BRANCH", "GITHUB_BRANCH_NAME", default="main")
-    root = _env_first("GITHUB_DATA_ROOT", default="data")
+# --- GitHub storage configuration (accept legacy key names too) ---
+GITHUB_OWNER = _env_first("GITHUB_OWNER", "GITHUB_REPO_OWNER")
+GITHUB_REPO = _env_first("GITHUB_REPO", "GITHUB_REPO_NAME")
+GITHUB_BRANCH = _env_first("GITHUB_BRANCH", default="main") or "main"
+GITHUB_TOKEN = _env_first("GITHUB_TOKEN", "GITHUB_PAT", "GITHUB_ACCESS_TOKEN")
 
+# Root folder in repo that contains "users/...". Typical: "data"
+GITHUB_DATA_ROOT = (_env_first("GITHUB_DATA_ROOT", "GITHUB_ROOT", "DATA_ROOT", default="data").strip().strip("/") or "data")
+
+def _github_missing() -> List[str]:
     missing = []
-    if not token: missing.append("GITHUB_TOKEN")
-    if not owner: missing.append("GITHUB_OWNER/GITHUB_REPO_OWNER")
-    if not repo: missing.append("GITHUB_REPO/GITHUB_REPO_NAME")
-    ok = (len(missing) == 0)
+    if not GITHUB_OWNER:
+        missing.append("GITHUB_OWNER")
+    if not GITHUB_REPO:
+        missing.append("GITHUB_REPO")
+    if not GITHUB_TOKEN:
+        missing.append("GITHUB_TOKEN")
+    return missing
 
-    return ok, {"token": token, "owner": owner, "repo": repo, "branch": branch, "root": root}, missing
+def _github_enabled() -> bool:
+    return len(_github_missing()) == 0
 
-def github_read_json(rel_path: str) -> Optional[dict]:
-    ok, cfg, missing = github_config()
-    if not ok:
-        raise HTTPException(status_code=503, detail=f"GitHub storage not configured. Missing: {missing}")
-
-    rel_path = rel_path.lstrip("/")
-    url = f"https://api.github.com/repos/{cfg['owner']}/{cfg['repo']}/contents/{rel_path}?ref={cfg['branch']}"
-    headers = {
-        "Authorization": f"token {cfg['token']}",
+def _gh_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
-        "User-Agent": "motilal-multiuser-trader",
-    }
-    r = requests.get(url, headers=headers, timeout=30)
-    if r.status_code == 404:
-        return None
-    if r.status_code >= 400:
-        raise HTTPException(status_code=503, detail=f"GitHub read failed: {r.status_code} {r.text[:200]}")
-    j = r.json()
-    if isinstance(j, dict) and j.get("type") == "file":
-        content_b64 = j.get("content", "")
-        if not content_b64:
-            return None
-        raw = base64.b64decode(content_b64).decode("utf-8")
-        return json.loads(raw)
-    return None
-
-def github_write_json(rel_path: str, data: dict) -> None:
-    ok, cfg, missing = github_config()
-    if not ok:
-        raise HTTPException(status_code=503, detail=f"GitHub storage not configured. Missing: {missing}")
-
-    rel_path = rel_path.lstrip("/")
-    url = f"https://api.github.com/repos/{cfg['owner']}/{cfg['repo']}/contents/{rel_path}"
-    headers = {
-        "Authorization": f"token {cfg['token']}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "motilal-multiuser-trader",
+        "User-Agent": "motilal-trader",
     }
 
-    # get sha if exists
+def _gh_api_url(path: str) -> str:
+    path = path.lstrip("/")
+    return f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
+
+def _github_get(path: str) -> Dict[str, Any]:
+    """
+    GET a GitHub 'contents' API object.
+    Returns dict or {"__not_found__": True} if missing.
+    """
+    if not _github_enabled():
+        raise HTTPException(status_code=500, detail=f"GitHub storage not configured. Missing: {', '.join(_github_missing())}. Set GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN in Render Environment.")
+    url = _gh_api_url(path)
+    try:
+        r = requests.get(url, headers=_gh_headers(), params={"ref": GITHUB_BRANCH}, timeout=30)
+        if r.status_code == 404:
+            return {"__not_found__": True}
+        r.raise_for_status()
+        j = r.json()
+        return j if isinstance(j, dict) else {"__list__": j}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"GitHub GET failed: {e}")
+
+def _github_put(path: str, content_bytes: bytes, message: str) -> Dict[str, Any]:
+    """
+    Create/update a file in GitHub at 'path' (repo-relative).
+    """
+    if not _github_enabled():
+        raise HTTPException(status_code=500, detail=f"GitHub storage not configured. Missing: {', '.join(_github_missing())}. Set GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN in Render Environment.")
+
+    # check existing to obtain sha (required for updates)
+    existing = _github_get(path)
     sha = None
-    r0 = requests.get(url + f"?ref={cfg['branch']}", headers=headers, timeout=30)
-    if r0.status_code == 200:
-        sha = r0.json().get("sha")
+    if isinstance(existing, dict) and existing.get("__not_found__"):
+        sha = None
+    elif isinstance(existing, dict) and existing.get("sha"):
+        sha = existing.get("sha")
 
-    payload = {
-        "message": f"update {rel_path}",
-        "content": base64.b64encode(json.dumps(data, indent=2).encode("utf-8")).decode("utf-8"),
-        "branch": cfg["branch"],
+    payload: Dict[str, Any] = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode("utf-8"),
+        "branch": GITHUB_BRANCH,
     }
     if sha:
         payload["sha"] = sha
 
-    r = requests.put(url, headers=headers, json=payload, timeout=30)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=503, detail=f"GitHub write failed: {r.status_code} {r.text[:200]}")
-
-# ---------------------------
-# Local storage fallback
-# ---------------------------
-DATA_DIR = os.getenv("DATA_DIR", "/mnt/data")
-
-def _local_path(rel_path: str) -> str:
-    rel_path = rel_path.lstrip("/")
-    return os.path.join(DATA_DIR, rel_path)
-
-def read_json_any(rel_path: str) -> Optional[dict]:
-    # Prefer GitHub if configured
-    ok, _, _ = github_config()
-    if ok:
-        return github_read_json(rel_path)
-
-    fp = _local_path(rel_path)
-    if not os.path.exists(fp):
-        return None
-    with open(fp, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def write_json_any(rel_path: str, data: dict) -> None:
-    ok, _, _ = github_config()
-    if ok:
-        github_write_json(rel_path, data)
-        return
-
-    fp = _local_path(rel_path)
-    os.makedirs(os.path.dirname(fp), exist_ok=True)
-    with open(fp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-# ---------------------------
-# User data helpers
-# ---------------------------
-def _user_clients_path(userid: str) -> str:
-    return f"data/users/{userid}/clients.json"
-
-def _user_groups_path(userid: str) -> str:
-    return f"data/users/{userid}/groups.json"
-
-def _user_copy_path(userid: str) -> str:
-    return f"data/users/{userid}/copy_setups.json"
-
-def get_clients(userid: str) -> List[dict]:
-    data = read_json_any(_user_clients_path(userid)) or {"clients": []}
-    return data.get("clients", [])
-
-def save_clients(userid: str, clients: List[dict]) -> None:
-    write_json_any(_user_clients_path(userid), {"clients": clients})
-
-def get_groups(userid: str) -> List[dict]:
-    data = read_json_any(_user_groups_path(userid)) or {"groups": []}
-    return data.get("groups", [])
-
-def save_groups(userid: str, groups: List[dict]) -> None:
-    write_json_any(_user_groups_path(userid), {"groups": groups})
-
-def get_copy_setups(userid: str) -> List[dict]:
-    data = read_json_any(_user_copy_path(userid)) or {"setups": []}
-    return data.get("setups", [])
-
-def save_copy_setups(userid: str, setups: List[dict]) -> None:
-    write_json_any(_user_copy_path(userid), {"setups": setups})
-
-def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-# ---------------------------
-# Motilal login/session cache (in-memory)
-# ---------------------------
-# Sessions are runtime only (Render restarts will clear).
-# We persist session_active / last_login_ts back into storage so UI can show status.
-SESSIONS: Dict[str, dict] = {}  # key = f"{userid}:{client_id}"
-
-def _session_key(userid: str, client_id: str) -> str:
-    return f"{userid}:{client_id}"
-
-def _mofsl_client_from_env(userid: str) -> MOFSLOPENAPI:
-    # These are the same defaults used in CT_FastAPI; keep compatible.
-    apikey = _env_first("MOFSL_API_KEY", "MOTILAL_API_KEY", default=_env_first("API_KEY"))
-    base_url = _env_first("MOFSL_BASE_URL", default="https://openapi.motilaloswal.com")
-    source_id = _env_first("MOFSL_SOURCE_ID", default="API")
-    browsername = _env_first("MOFSL_BROWSER_NAME", default="chrome")
-    browserversion = _env_first("MOFSL_BROWSER_VERSION", default="1.0")
-    return MOFSLOPENAPI(apikey, base_url, None, source_id, browsername, browserversion)
-
-def _extract_login_fields(client: dict) -> Tuple[str, str, str, Optional[str]]:
-    # We support both schemas:
-    # 1) creds: { type:'motilal', client_code, password, mpin, totp_key? }
-    # 2) credentials: { password, pan/mpin, totp_key? } etc.
-    creds = client.get("creds") or client.get("credentials") or {}
-    client_id = client.get("client_id") or client.get("userid") or creds.get("client_code") or creds.get("client_id") or ""
-    password = creds.get("password") or ""
-    twofa = creds.get("mpin") or creds.get("pan") or creds.get("2fa") or ""
-    totp_key = creds.get("totp_key") or creds.get("totp") or client.get("totp_key")
-    return client_id, password, twofa, totp_key
-
-def login_one_client(userid: str, client_id: str) -> dict:
-    clients = get_clients(userid)
-    idx = next((i for i,c in enumerate(clients) if (c.get("client_id") or c.get("userid")) == client_id), None)
-    if idx is None:
-        raise HTTPException(status_code=404, detail="Client not found")
-
-    client = clients[idx]
-    cid, password, twofa, totp_key = _extract_login_fields(client)
-
-    if not cid or not password or not twofa:
-        # mark as not active but keep pending
-        client["session_active"] = False
-        client["last_login_ts"] = _now_iso()
-        client["last_login_error"] = "Missing login fields (client_id/password/2FA)."
-        clients[idx] = client
-        save_clients(userid, clients)
-        return {"status": "FAILED", "message": client["last_login_error"]}
-
-    totp = None
-    if totp_key and pyotp:
-        try:
-            totp = pyotp.TOTP(totp_key).now()
-        except Exception:
-            totp = None
-
+    url = _gh_api_url(path)
     try:
-        mof = _mofsl_client_from_env(userid)
-        resp = mof.login(cid, password, twofa, totp, cid)
-        if resp and resp.get("status") == "SUCCESS":
-            # store session runtime
-            SESSIONS[_session_key(userid, client_id)] = {
-                "client_id": client_id,
-                "login_ts": _now_iso(),
-                "raw": resp,
-            }
-            client["session_active"] = True
-            client["session"] = "active"
-            client["last_login_ts"] = _now_iso()
-            client.pop("last_login_error", None)
-        else:
-            client["session_active"] = False
-            client["session"] = "pending"
-            client["last_login_ts"] = _now_iso()
-            client["last_login_error"] = (resp or {}).get("message") or "Login failed"
-        clients[idx] = client
-        save_clients(userid, clients)
-        return resp or {"status": "FAILED", "message": "Login failed"}
+        r = requests.put(url, headers=_gh_headers(), json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
-        client["session_active"] = False
-        client["session"] = "pending"
-        client["last_login_ts"] = _now_iso()
-        client["last_login_error"] = str(e)
-        clients[idx] = client
-        save_clients(userid, clients)
-        return {"status": "ERROR", "message": str(e)}
+        raise HTTPException(status_code=502, detail=f"GitHub PUT failed: {e}")
 
-def login_all_clients(userid: str) -> dict:
-    clients = get_clients(userid)
-    out = []
-    for c in clients:
-        cid = c.get("client_id") or c.get("userid")
-        if not cid:
-            continue
-        out.append({"client_id": cid, "result": login_one_client(userid, cid)})
-        time.sleep(0.2)
-    return {"ok": True, "count": len(out), "results": out}
-
-# ---------------------------
-# Health / Debug
-# ---------------------------
-@app.get("/health")
-def health():
-    return {"ok": True, "ts": _now_iso()}
-
-@app.get("/debug_env")
-def debug_env():
-    ok, cfg, missing = github_config()
-    return {
-        "github_configured": ok,
-        "missing": missing,
-        "github_owner_set": bool(cfg.get("owner")),
-        "github_repo_set": bool(cfg.get("repo")),
-        "github_branch": cfg.get("branch"),
-        "github_data_root": cfg.get("root"),
-        "github_token_len": len(cfg.get("token") or ""),
-        "allowed_origins": allowed_origins,
-    }
-
-# ---------------------------
-# Symbols (kept from your minimal file)
-# ---------------------------
-SYMBOLS_DB_PATH = os.getenv("SYMBOLS_DB_PATH", _local_path("symbols_db.json"))
-
-def _load_symbols() -> List[dict]:
-    try:
-        if os.path.exists(SYMBOLS_DB_PATH):
-            with open(SYMBOLS_DB_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
+def _github_list_dir(path: str) -> List[Dict[str, Any]]:
+    """
+    List a directory using GitHub contents API. Returns [] if not found.
+    """
+    obj = _github_get(path)
+    if isinstance(obj, dict) and obj.get("__not_found__"):
+        return []
+    if isinstance(obj, dict) and "__list__" in obj and isinstance(obj["__list__"], list):
+        return obj["__list__"]
     return []
 
-def _save_symbols(rows: List[dict]) -> None:
-    os.makedirs(os.path.dirname(SYMBOLS_DB_PATH), exist_ok=True)
-    with open(SYMBOLS_DB_PATH, "w", encoding="utf-8") as f:
-        json.dump(rows, f)
+def _github_read_json(path: str) -> Dict[str, Any]:
+    obj = _github_get(path)
+    if isinstance(obj, dict) and obj.get("__not_found__"):
+        return {}
+    if not isinstance(obj, dict) or "content" not in obj:
+        return {}
+    try:
+        raw = base64.b64decode((obj.get("content") or "").encode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
 
-@app.post("/symbols/rebuild")
-def symbols_rebuild():
-    # Placeholder: keep endpoint stable. If you already rebuild elsewhere, wire it here.
-    # For now, we just ensure the file exists.
-    rows = _load_symbols()
-    _save_symbols(rows)
-    return {"ok": True, "count": len(rows)}
+def _github_write_json(path: str, data: Dict[str, Any], message: str) -> None:
+    b = (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    _github_put(path, b, message=message)
 
-@app.get("/search_symbols")
-def search_symbols(q: str = Query("", min_length=0), limit: int = 20):
-    qn = (q or "").strip().lower()
-    rows = _load_symbols()
-    if not qn:
-        return {"results": rows[:limit], "count": min(len(rows), limit)}
-    out = []
-    for r in rows:
-        hay = " ".join([str(r.get("symbol","")), str(r.get("name","")), str(r.get("exchange",""))]).lower()
-        if qn in hay:
-            out.append(r)
-            if len(out) >= limit:
-                break
-    return {"results": out, "count": len(out)}
+def _safe(s: Any) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", str(s or "").strip())
 
-# ---------------------------
-# Clients API (UI expects)
-# ---------------------------
-@app.get("/get_clients")
-def api_get_clients(userid: str = "", user_id: str = "", auto_login: int = 0, bg: BackgroundTasks = None):
-    uid = (userid or user_id or "").strip().strip('"')
+def _pick(*vals: Any) -> str:
+    for v in vals:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+def require_user(user_id: str) -> str:
+    uid = (user_id or "").strip()
     if not uid:
-        raise HTTPException(status_code=400, detail="userid required")
-    clients = get_clients(uid)
+        raise HTTPException(status_code=401, detail="Missing X-User-Id header (logged in user).")
+    return uid
 
-    # normalize for UI
-    for c in clients:
-        if "session" not in c:
-            c["session"] = "active" if c.get("session_active") else "pending"
+def _client_rel_path(user_id: str, client_id: str) -> str:
+    # repo path: data/users/<user>/clients/motilal/<client>.json
+    return f"{GITHUB_DATA_ROOT}/users/{_safe(user_id)}/clients/motilal/{_safe(client_id)}.json"
 
-    if auto_login and bg is not None:
-        bg.add_task(login_all_clients, uid)
+def _client_dir(user_id: str) -> str:
+    return f"{GITHUB_DATA_ROOT}/users/{_safe(user_id)}/clients/motilal"
 
-    return {"userid": uid, "clients": clients}
+# ============================================================
+# Motilal client login helpers (web multi-user)
+# ============================================================
+# We keep sessions in-memory (per instance). Persistent client creds stay in GitHub JSON.
+# "session_active" reflects the last known login state.
+try:
+    from MotilalOswalApi import MOFSLOPENAPI  # type: ignore
+except Exception:
+    MOFSLOPENAPI = None  # fallback in case dependency missing in env
 
-# REST alias expected by some UI builds
-@app.get("/clients")
-def api_clients(userid: str = "", user_id: str = ""):
-    return api_get_clients(userid=userid, user_id=user_id)
+try:
+    import pyotp
+except Exception:
+    pyotp = None  # fallback
 
+MOFSL_BASE_URL = os.getenv("MOFSL_BASE_URL", "https://openapi.motilaloswal.com")
+MOFSL_SOURCE_ID = os.getenv("MOFSL_SOURCE_ID", "WEBSCRAP")  # keep stable default
+
+# in-memory sessions: key -> dict with api instance + timestamps
+_mofsl_sessions: Dict[str, Dict[str, Any]] = {}
+
+def _norm_userid(raw: Optional[str]) -> str:
+    """Accept userid from header or query; also fixes accidental quotes like %22pra%22."""
+    if not raw:
+        return ""
+    s = raw.strip()
+    if (len(s) >= 2) and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+        s = s[1:-1]
+    return s.strip()
+
+def _resolve_userid(request: Request, userid: Optional[str] = None, user_id: Optional[str] = None, x_user_id: Optional[str] = None) -> str:
+    """Resolve userid from (1) explicit args, (2) query, (3) header, in that order."""
+    for v in (userid, user_id, x_user_id):
+        u = _norm_userid(v)
+        if u:
+            return u
+    for k in ("userid", "user_id"):
+        u = _norm_userid(request.query_params.get(k))
+        if u:
+            return u
+    u = _norm_userid(request.headers.get("x-user-id"))
+    if u:
+        return u
+    return ""
+
+async def _login_motilal_client_doc(user: str, doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Attempt login for a single client doc; updates doc['session_active'] in GitHub."""
+    if MOFSLOPENAPI is None:
+        await github_write_user_client(user, doc.get("userid", ""), {**doc, "session_active": False, "session_error": "MOFSLOPENAPI not installed"})
+        return {"ok": False, "error": "MOFSLOPENAPI not installed"}
+
+    client_userid = doc.get("userid") or doc.get("client_id") or ""
+    password = doc.get("password") or ""
+    apikey = doc.get("apikey") or doc.get("api_key") or ""
+    totpkey = doc.get("totpkey") or doc.get("totp_key") or ""
+
+    if not client_userid or not password:
+        await github_write_user_client(user, doc.get("userid", ""), {**doc, "session_active": False, "session_error": "Missing userid/password"})
+        return {"ok": False, "error": "Missing userid/password"}
+
+    twofa = ""
+    if totpkey and pyotp is not None:
+        try:
+            twofa = pyotp.TOTP(totpkey).now()
+        except Exception:
+            twofa = ""
+
+    try:
+        api = MOFSLOPENAPI(
+            base_url=MOFSL_BASE_URL,
+            api_key=apikey,
+            client_id=client_userid,
+            password=password,
+            totp=twofa,
+            source_id=MOFSL_SOURCE_ID,
+        )
+        # Support common SDK method names
+        if hasattr(api, "login"):
+            resp = api.login()
+        elif hasattr(api, "login_request"):
+            resp = api.login_request()
+        else:
+            resp = {"message": "SDK missing login method"}
+
+        ok = bool(resp) and ("token" in str(resp).lower() or "success" in str(resp).lower() or getattr(api, "auth_token", None))
+        sess_key = f"{user}:{client_userid}"
+        if ok:
+            _mofsl_sessions[sess_key] = {"api": api, "ts": time.time()}
+            updated = {**doc, "session_active": True, "session_error": "", "last_login_ts": time.time()}
+        else:
+            updated = {**doc, "session_active": False, "session_error": str(resp)[:500]}
+
+        await github_write_user_client(user, doc.get("userid", ""), updated)
+        return {"ok": ok, "response": resp}
+    except Exception as e:
+        updated = {**doc, "session_active": False, "session_error": str(e)[:500]}
+        await github_write_user_client(user, doc.get("userid", ""), updated)
+        return {"ok": False, "error": str(e)}
+
+async def _login_all_clients_for_user(user: str) -> Dict[str, Any]:
+    clients = await github_list_user_clients(user)
+    results = []
+    for doc in clients:
+        results.append(await _login_motilal_client_doc(user, doc))
+    ok = all(r.get("ok") for r in results) if results else True
+    return {"ok": ok, "count": len(results), "results": results}
 @app.post("/add_client")
-def api_add_client(payload: dict, background: BackgroundTasks):
-    userid = (payload.get("userid") or payload.get("user_id") or payload.get("userId") or "").strip().strip('"')
-    if not userid:
-        raise HTTPException(status_code=400, detail="userid required in payload")
+async def add_client(
+    payload: Dict[str, Any] = Body(...),
+    user_id: str = Header("", alias="X-User-Id"),
+) -> Dict[str, Any]:
+    """
+    Save a Motilal client for the logged-in user into GitHub.
+    Reference fields from CT_FastAPI: name, userid, password, pan, apikey, totpkey, capital, session_active. fileciteturn4file4L1-L22
+    """
+    uid = require_user(user_id)
 
-    client_id = (payload.get("client_id") or payload.get("userid") or payload.get("clientId") or "").strip()
-    display_name = payload.get("display_name") or payload.get("name") or payload.get("client_name") or client_id
+    client_id = _pick(payload.get("userid"), payload.get("client_id"))
+    if not client_id:
+        raise HTTPException(status_code=400, detail="client_id/userid required")
 
-    creds = payload.get("creds") or payload.get("credentials") or {}
-    # If frontend uses { broker, client_id, display_name, capital, creds }, keep compatible
-    capital = payload.get("capital")
+    display_name = (payload.get("name") or payload.get("display_name") or client_id).strip()
 
-    clients = get_clients(userid)
-    if any((c.get("client_id") or c.get("userid")) == client_id for c in clients):
-        raise HTTPException(status_code=400, detail="Client already exists")
+    doc = dict(payload)
+    doc["broker"] = "motilal"
+    doc["userid"] = client_id
+    doc["name"] = display_name
+    doc.setdefault("session_active", False)
+    doc.setdefault("created_at", datetime.utcnow().isoformat())
+    doc["updated_at"] = datetime.utcnow().isoformat()
 
-    newc = {
-        "broker": "motilal",
-        "client_id": client_id,
-        "name": display_name,
-        "capital": capital,
-        "creds": creds,
-        "session_active": False,
-        "session": "pending",
-        "created_at": _now_iso(),
-        "updated_at": _now_iso(),
-    }
-    clients.append(newc)
-    save_clients(userid, clients)
+    rel = _client_rel_path(uid, client_id)
+    _github_write_json(rel, doc, message=f"Add/Update client {client_id} for {uid}")
 
-    # Auto-login newly added client
-    background.add_task(login_one_client, userid, client_id)
+    return {"success": True, "message": "Client saved to GitHub.", "client_id": client_id}
 
-    return {"ok": True, "client_id": client_id}
+@app.get("/get_clients")
+@app.get("/clients")
+async def get_clients(
+    request: Request,
+    userid: str = Query("", description="user id"),
+    user_id: str = Query("", description="user id alt"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+) -> Dict[str, Any]:
+    """Load clients for a user from GitHub.
 
-@app.post("/delete_client")
-def api_delete_client(payload: dict):
-    userid = (payload.get("userid") or payload.get("user_id") or "").strip().strip('"')
-    client_id = (payload.get("client_id") or "").strip()
-    if not userid or not client_id:
-        raise HTTPException(status_code=400, detail="userid and client_id required")
+    Supports:
+      - ?userid=pra (frontend)
+      - ?user_id=pra
+      - X-User-Id header
+    """
+    uid = _resolve_userid(request, userid=userid, user_id=user_id, x_user_id=x_user_id)
+    if not uid:
+        raise HTTPException(status_code=400, detail="Missing userid")
 
-    clients = get_clients(userid)
-    clients2 = [c for c in clients if (c.get("client_id") or c.get("userid")) != client_id]
-    save_clients(userid, clients2)
-    SESSIONS.pop(_session_key(userid, client_id), None)
-    return {"ok": True}
+    out: List[Dict[str, Any]] = []
+    dir_path = _client_dir(uid)
+    for it in _github_list_dir(dir_path):
+        if it.get("type") != "file":
+            continue
+        fn = it.get("name") or ""
+        if not fn.endswith(".json"):
+            continue
 
-@app.post("/login_client")
-def api_login_client(payload: dict):
-    userid = (payload.get("userid") or payload.get("user_id") or "").strip().strip('"')
-    client_id = (payload.get("client_id") or "").strip()
-    if not userid or not client_id:
-        raise HTTPException(status_code=400, detail="userid and client_id required")
-    return login_one_client(userid, client_id)
+        doc = _github_read_json(f"{dir_path}/{fn}") or {}
+        if not isinstance(doc, dict):
+            continue
+
+        client_id = str(doc.get("userid") or doc.get("client_id") or "").strip()
+        session_status = "Logged in" if bool(doc.get("session_active")) else "pending"
+
+        out.append(
+            {
+                "name": doc.get("name", "") or doc.get("display_name", ""),
+                "client_id": client_id,
+                "capital": doc.get("capital", "") or "",
+                "session": session_status,
+                "broker": "motilal",
+            }
+        )
+
+    out.sort(key=lambda x: (x.get("name") or "", x.get("client_id") or ""))
+    return {"ok": True, "clients": out}
+
 
 @app.post("/login_all_clients")
-def api_login_all(payload: dict):
-    userid = (payload.get("userid") or payload.get("user_id") or "").strip().strip('"')
-    if not userid:
-        raise HTTPException(status_code=400, detail="userid required")
-    return login_all_clients(userid)
+async def login_all_clients(
+    request: Request,
+    userid: str = Query("", description="user id"),
+    user_id: str = Query("", description="user id alt"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    user = _resolve_userid(request, userid=userid, user_id=user_id, x_user_id=x_user_id)
+    if not user:
+        raise HTTPException(status_code=400, detail="Missing userid")
+    return await _login_all_clients_for_user(user)
 
-# ---------------------------
-# Groups API (UI expects)
-# ---------------------------
-@app.get("/get_groups")
-def api_get_groups(userid: str = "", user_id: str = ""):
-    uid = (userid or user_id or "").strip().strip('"')
-    if not uid:
-        raise HTTPException(status_code=400, detail="userid required")
-    return {"userid": uid, "groups": get_groups(uid)}
-
-@app.get("/groups")
-def api_groups(userid: str = "", user_id: str = ""):
-    return api_get_groups(userid=userid, user_id=user_id)
-
-@app.post("/create_group")
-def api_create_group(payload: dict):
-    userid = (payload.get("userid") or payload.get("user_id") or "").strip().strip('"')
-    name = (payload.get("group_name") or payload.get("name") or "").strip()
-    members = payload.get("members") or payload.get("client_ids") or []
-    if not userid or not name:
-        raise HTTPException(status_code=400, detail="userid and group_name required")
-
-    groups = get_groups(userid)
-    if any(g.get("name") == name for g in groups):
-        raise HTTPException(status_code=400, detail="Group already exists")
-
-    groups.append({"name": name, "members": members, "created_at": _now_iso()})
-    save_groups(userid, groups)
-    return {"ok": True}
-
-@app.post("/delete_group")
-def api_delete_group(payload: dict):
-    userid = (payload.get("userid") or payload.get("user_id") or "").strip().strip('"')
-    name = (payload.get("group_name") or payload.get("name") or "").strip()
-    if not userid or not name:
-        raise HTTPException(status_code=400, detail="userid and group_name required")
-    groups = [g for g in get_groups(userid) if g.get("name") != name]
-    save_groups(userid, groups)
-    return {"ok": True}
-
-# ---------------------------
-# CopyTrading setups (kept compatible with CT_FastAPI UI tabs)
-# ---------------------------
-@app.post("/save_copytrading_setup")
-def api_save_copy(payload: dict):
-    userid = (payload.get("userid") or payload.get("user_id") or "").strip().strip('"')
-    if not userid:
-        raise HTTPException(status_code=400, detail="userid required")
-    setups = get_copy_setups(userid)
-    setups.append({**payload, "saved_at": _now_iso()})
-    save_copy_setups(userid, setups)
-    return {"ok": True}
-
-@app.get("/list_copytrading_setups")
-def api_list_copy(userid: str = "", user_id: str = ""):
-    uid = (userid or user_id or "").strip().strip('"')
-    if not uid:
-        raise HTTPException(status_code=400, detail="userid required")
-    return {"userid": uid, "setups": get_copy_setups(uid)}
-
-@app.post("/delete_copy_setup")
-def api_delete_copy(payload: dict):
-    userid = (payload.get("userid") or payload.get("user_id") or "").strip().strip('"')
-    setup_id = payload.get("setup_id")
-    if not userid or setup_id is None:
-        raise HTTPException(status_code=400, detail="userid and setup_id required")
-    setups = [s for s in get_copy_setups(userid) if s.get("setup_id") != setup_id]
-    save_copy_setups(userid, setups)
-    return {"ok": True}
-
-@app.post("/enable_copy_setup")
-def api_enable_copy(payload: dict):
-    payload["enabled"] = True
-    return api_save_copy(payload)
-
-@app.post("/disable_copy_setup")
-def api_disable_copy(payload: dict):
-    payload["enabled"] = False
-    return api_save_copy(payload)
-
-# ---------------------------
-# Trading endpoints placeholders (wire your existing Motilal functions here)
-# ---------------------------
-@app.post("/place_order")
-def place_order(payload: dict):
-    # Implement using active session in SESSIONS + MOFSLOPENAPI as in your CT_FastAPI.
-    raise HTTPException(status_code=501, detail="place_order not wired in this file yet")
-
-@app.get("/get_orders")
-def get_orders(userid: str = "", user_id: str = "", client_id: str = ""):
-    raise HTTPException(status_code=501, detail="get_orders not wired in this file yet")
-
-@app.get("/get_positions")
-def get_positions(userid: str = "", user_id: str = "", client_id: str = ""):
-    raise HTTPException(status_code=501, detail="get_positions not wired in this file yet")
-
-@app.get("/get_holdings")
-def get_holdings(userid: str = "", user_id: str = "", client_id: str = ""):
-    raise HTTPException(status_code=501, detail="get_holdings not wired in this file yet")
-
-@app.get("/get_summary")
-def get_summary(userid: str = "", user_id: str = "", client_id: str = ""):
-    raise HTTPException(status_code=501, detail="get_summary not wired in this file yet")
+@app.post("/login_client")
+async def login_client(
+    request: Request,
+    client_userid: str = Body(..., embed=True),
+    userid: str = Query("", description="user id"),
+    user_id: str = Query("", description="user id alt"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    user = _resolve_userid(request, userid=userid, user_id=user_id, x_user_id=x_user_id)
+    if not user:
+        raise HTTPException(status_code=400, detail="Missing userid")
+    doc = await github_read_user_client(user, client_userid)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return await _login_motilal_client_doc(user, doc)
