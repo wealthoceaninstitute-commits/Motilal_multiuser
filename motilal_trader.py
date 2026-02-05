@@ -71,6 +71,20 @@ mofsl_sessions_lock = threading.Lock()
 # GitHub storage config
 ###############################################################################
 
+@app.get("/debug_env")
+def debug_env():
+    """Safe env diagnostics (does NOT expose secrets)."""
+    missing = _github_missing()
+    return {
+        "github_configured": len(missing) == 0,
+        "missing": missing,
+        "github_owner_set": bool(GITHUB_OWNER),
+        "github_repo_set": bool(GITHUB_REPO),
+        "github_branch": GITHUB_BRANCH,
+        "github_data_root": GITHUB_DATA_ROOT,
+        "github_token_len": len(GITHUB_TOKEN) if GITHUB_TOKEN else 0,
+    }
+
 GITHUB_OWNER = _env_first("GITHUB_OWNER", "GITHUB_REPO_OWNER")
 GITHUB_REPO = _env_first("GITHUB_REPO", "GITHUB_REPO_NAME")
 GITHUB_BRANCH = _env_first("GITHUB_BRANCH", default="main") or "main"
@@ -425,4 +439,5 @@ def delete_group(request: Request, group_name: str = Query("", alias="group_name
 # Trading endpoints (place_order/get_orders/positions/etc.) should use mofsl_sessions
 # keyed by (owner_userid, client_id). If you want, I can wire those next.
 ###############################################################################
+
 
